@@ -4,4 +4,4 @@ Public update source for the `video_plugin_youzan_aigc` plugin.
 
 Manifest: https://cdn.jsdelivr.net/gh/609335334-rgb/youzan-aigc-plugin-updates@main/manifest.json
 
-Update package: https://cdn.jsdelivr.net/gh/609335334-rgb/youzan-aigc-plugin-updates@main/youzan-aigc-plugin-v1.1.1-20260913143145.zip
+Update package: https://cdn.jsdelivr.net/gh/609335334-rgb/youzan-aigc-plugin-updates@main/youzan-aigc-plugin-v1.1.2-20260913143741.zip

@@ -37,10 +37,15 @@ from plugin_utils import load_plugin_config
 
 _PLUGIN_FILE = __file__
 _PLUGIN_ID = "video_plugin_youzan_aigc"
-_PLUGIN_VERSION = "1.1.1"
+_PLUGIN_VERSION = "1.1.2"
 _DEFAULT_UPDATE_MANIFEST_URL = (
     "https://cdn.jsdelivr.net/gh/609335334-rgb/"
     "youzan-aigc-plugin-updates@main/manifest.json"
+)
+_DEFAULT_UPDATE_MANIFEST_URLS = (
+    _DEFAULT_UPDATE_MANIFEST_URL,
+    "https://raw.githubusercontent.com/609335334-rgb/"
+    "youzan-aigc-plugin-updates/main/manifest.json",
 )
 
 _DEFAULT_BASE_URL = "https://youzan666.vip"
@@ -129,36 +134,67 @@ def _compute_sha256(file_path):
 
 def _check_update_available():
     params = get_params()
-    manifest_url = str(
+    configured_url = str(
         params.get("update_manifest_url") or _DEFAULT_UPDATE_MANIFEST_URL
     ).strip()
-    try:
-        response = requests.get(manifest_url, timeout=30)
-        if response.status_code != 200:
-            raise Exception(f"HTTP {response.status_code}")
-        manifest = response.json()
-    except Exception as exc:
-        return {"ok": False, "error": f"拉取更新清单失败: {exc}"}
+    candidates = []
+    for candidate in (configured_url, *_DEFAULT_UPDATE_MANIFEST_URLS):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
 
-    plugins = manifest.get("plugins") if isinstance(manifest, dict) else None
-    if not isinstance(plugins, list):
-        return {"ok": False, "error": "manifest.json 格式错误：缺少 plugins"}
-    remote = next((item for item in plugins if isinstance(item, dict) and item.get("plugin_id") == _PLUGIN_ID), None)
-    if not remote:
-        return {"ok": True, "has_update": False, "message": f"清单中未找到插件: {_PLUGIN_ID}"}
-    remote_version = str(remote.get("version") or "").strip()
-    if not remote_version:
-        return {"ok": False, "error": "更新项缺少 version"}
+    best_manifest_url = ""
+    best_remote = None
+    errors = []
+    for manifest_url in candidates:
+        try:
+            response = requests.get(manifest_url, timeout=30)
+            if response.status_code != 200:
+                raise Exception(f"HTTP {response.status_code}")
+            manifest = response.json()
+            plugins = manifest.get("plugins") if isinstance(manifest, dict) else None
+            if not isinstance(plugins, list):
+                raise Exception("manifest.json 格式错误：缺少 plugins")
+            remote = next(
+                (
+                    item
+                    for item in plugins
+                    if isinstance(item, dict) and item.get("plugin_id") == _PLUGIN_ID
+                ),
+                None,
+            )
+            if not remote:
+                raise Exception(f"清单中未找到插件: {_PLUGIN_ID}")
+            remote_version = str(remote.get("version") or "").strip()
+            if not remote_version:
+                raise Exception("更新项缺少 version")
+        except Exception as exc:
+            errors.append(f"{manifest_url}: {exc}")
+            continue
+        if best_remote is None or _is_newer_version(
+            remote_version, best_remote.get("version")
+        ):
+            best_manifest_url = manifest_url
+            best_remote = remote
+
+    if best_remote is None:
+        return {"ok": False, "error": "拉取更新清单失败: " + " | ".join(errors)}
+    remote_version = str(best_remote.get("version") or "").strip()
     if not _is_newer_version(remote_version, _PLUGIN_VERSION):
-        return {"ok": True, "has_update": False, "message": f"当前已是最新版（本地 {_PLUGIN_VERSION}，远端 {remote_version}）"}
+        return {
+            "ok": True,
+            "has_update": False,
+            "message": f"当前已是最新版（本地 {_PLUGIN_VERSION}，远端 {remote_version}）",
+            "manifest_url": best_manifest_url,
+        }
     return {
         "ok": True,
         "has_update": True,
         "local_version": _PLUGIN_VERSION,
         "remote_version": remote_version,
-        "changelog": str(remote.get("changelog") or "无"),
-        "download_url": str(remote.get("download_url") or "").strip(),
-        "sha256": str(remote.get("sha256") or "").strip().lower(),
+        "changelog": str(best_remote.get("changelog") or "无"),
+        "download_url": str(best_remote.get("download_url") or "").strip(),
+        "sha256": str(best_remote.get("sha256") or "").strip().lower(),
+        "manifest_url": best_manifest_url,
     }
 
 

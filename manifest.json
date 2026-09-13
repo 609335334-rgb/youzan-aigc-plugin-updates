@@ -2,10 +2,10 @@
   "plugins": [
     {
       "plugin_id": "video_plugin_youzan_aigc",
-      "version": "1.1.1",
-      "download_url": "https://cdn.jsdelivr.net/gh/609335334-rgb/youzan-aigc-plugin-updates@main/youzan-aigc-plugin-v1.1.1-20260913143145.zip",
-      "sha256": "09148d7ec0bbe028ce98058778499f936247ea8c904493723ae437141065b82c",
-      "changelog": "内置固定更新源，更新入口移至 API Key 上方；更新包改为 ZIP，可同步更新 main.py、界面与插件信息。"
+      "version": "1.1.2",
+      "download_url": "https://cdn.jsdelivr.net/gh/609335334-rgb/youzan-aigc-plugin-updates@main/youzan-aigc-plugin-v1.1.2-20260913143741.zip",
+      "sha256": "8b095816f708cdfae04795ee2b7255493ce0cfec4fd68a8dc2d4c7fe9675df71",
+      "changelog": "固定更新源增加 GitHub Raw 自动回退；更新时会在多个来源中选择最高版本，避免 CDN 缓存导致漏更新。"
     }
   ]
 }

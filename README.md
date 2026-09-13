@@ -1,5 +1,7 @@
 # youzan-aigc-plugin-updates
 
-Public update source for `video_plugin_youzan_aigc`.
+Public update source for the `video_plugin_youzan_aigc` plugin.
 
-Manifest: https://raw.githubusercontent.com/609335334-rgb/youzan-aigc-plugin-updates/main/manifest.json
+Manifest: https://cdn.jsdelivr.net/gh/609335334-rgb/youzan-aigc-plugin-updates@main/manifest.json
+
+Update package: https://cdn.jsdelivr.net/gh/609335334-rgb/youzan-aigc-plugin-updates@main/youzan-aigc-plugin-v1.1.1-20260913143145.zip

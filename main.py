@@ -37,7 +37,11 @@ from plugin_utils import load_plugin_config
 
 _PLUGIN_FILE = __file__
 _PLUGIN_ID = "video_plugin_youzan_aigc"
-_PLUGIN_VERSION = "1.1.0"
+_PLUGIN_VERSION = "1.1.1"
+_DEFAULT_UPDATE_MANIFEST_URL = (
+    "https://cdn.jsdelivr.net/gh/609335334-rgb/"
+    "youzan-aigc-plugin-updates@main/manifest.json"
+)
 
 _DEFAULT_BASE_URL = "https://youzan666.vip"
 _MODELS_PATH = "/v1/models"
@@ -92,7 +96,7 @@ _default_params = {
     "timeout": 900,
     "poll_interval": MIN_POLL_INTERVAL,
     "max_poll_attempts": 300,
-    "update_manifest_url": "",
+    "update_manifest_url": _DEFAULT_UPDATE_MANIFEST_URL,
 }
 
 
@@ -125,9 +129,9 @@ def _compute_sha256(file_path):
 
 def _check_update_available():
     params = get_params()
-    manifest_url = str(params.get("update_manifest_url") or "").strip()
-    if not manifest_url:
-        return {"ok": False, "error": "请先填写更新清单 URL"}
+    manifest_url = str(
+        params.get("update_manifest_url") or _DEFAULT_UPDATE_MANIFEST_URL
+    ).strip()
     try:
         response = requests.get(manifest_url, timeout=30)
         if response.status_code != 200:

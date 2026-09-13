@@ -3,7 +3,7 @@
     {
       "plugin_id": "video_plugin_youzan_aigc",
       "version": "1.1.0",
-      "download_url": "https://raw.githubusercontent.com/609335334-rgb/youzan-aigc-plugin-updates/main/main.py",
+      "download_url": "https://cdn.jsdelivr.net/gh/609335334-rgb/youzan-aigc-plugin-updates@main/main.py",
       "changelog": "支持 taskId、Base64 图片、Uguu 音频/视频上传、10 秒轮询及插件自动更新。"
     }
   ]

@@ -2,10 +2,10 @@
   "plugins": [
     {
       "plugin_id": "video_plugin_youzan_aigc",
-      "version": "1.1.4",
-      "download_url": "https://cdn.jsdelivr.net/gh/609335334-rgb/youzan-aigc-plugin-updates@main/youzan-aigc-plugin-v1.1.4-20260915133803.zip",
-      "sha256": "903c19bac23bbef7f8f386e3deb2659c8b2407cc6d8305cf5e2a931179989446",
-      "changelog": ""
+      "version": "1.1.5",
+      "download_url": "https://cdn.jsdelivr.net/gh/609335334-rgb/youzan-aigc-plugin-updates@main/youzan-aigc-plugin-v1.1.5-20260915143140.zip",
+      "sha256": "066d3cd93591667cb833528797696cd1eabe79014fb8beb866cd23252e56ab46",
+      "changelog": "安装更新前校验更新包版本：包内版本须与更新清单一致且高于当前版本，避免装到旧包；覆盖前备份全部被替换文件，失败可完整回滚。"
     }
   ]
 }

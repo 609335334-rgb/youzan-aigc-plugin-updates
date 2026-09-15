@@ -39,7 +39,7 @@ from plugin_utils import load_plugin_config
 
 _PLUGIN_FILE = __file__
 _PLUGIN_ID = "video_plugin_youzan_aigc"
-_PLUGIN_VERSION = "1.1.4"
+_PLUGIN_VERSION = "1.1.5"
 _DEFAULT_UPDATE_MANIFEST_URL = (
     "https://cdn.jsdelivr.net/gh/609335334-rgb/"
     "youzan-aigc-plugin-updates@main/manifest.json"
@@ -159,6 +159,16 @@ def _compute_sha256(file_path):
     return hasher.hexdigest().lower()
 
 
+def _read_package_version(main_path):
+    """读取更新包内 main.py 的 _PLUGIN_VERSION，安装前用于校验包与更新清单是否一致。"""
+    try:
+        text = Path(main_path).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+    match = re.search(r'_PLUGIN_VERSION\s*=\s*["\']([^"\']+)["\']', text)
+    return match.group(1).strip() if match else ""
+
+
 def _check_update_available():
     params = get_params()
     configured_url = str(
@@ -252,7 +262,7 @@ def _find_update_root(package_path, work_dir):
     raise Exception("更新包中未找到 main.py")
 
 
-def _execute_update(download_url, expected_sha256=""):
+def _execute_update(download_url, expected_sha256="", expected_version=""):
     if not download_url.startswith(("http://", "https://")):
         return {"ok": False, "error": "download_url 必须是 http(s) 地址"}
     work_dir = Path(tempfile.mkdtemp(prefix=f"{_PLUGIN_ID}_update_"))
@@ -270,9 +280,24 @@ def _execute_update(download_url, expected_sha256=""):
             raise Exception("SHA-256 校验失败，已取消安装")
 
         source_dir, source_main = _find_update_root(package_path, work_dir)
+        package_version = _read_package_version(source_main)
+        if not package_version:
+            raise Exception("更新包内 main.py 缺少版本号，已取消安装")
+        if expected_version and package_version != expected_version:
+            raise Exception(
+                f"更新包版本与更新清单不一致（清单 {expected_version} / 包内 {package_version}），已取消安装"
+            )
+        if not _is_newer_version(package_version, _PLUGIN_VERSION):
+            raise Exception(
+                f"更新包版本异常（包内 {package_version} 不高于当前 {_PLUGIN_VERSION}），已取消安装"
+            )
+
         target_dir = Path(_PLUGIN_FILE).parent
         backup = target_dir / f"main.py.bak.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         shutil.copy2(_PLUGIN_FILE, backup)
+        restore_dir = work_dir / "restore"
+        restore_dir.mkdir()
+        restore_items = []
         try:
             shutil.copy2(source_main, _PLUGIN_FILE)
             if package_path.suffix.lower() == ".zip":
@@ -280,6 +305,13 @@ def _execute_update(download_url, expected_sha256=""):
                     if item.name == "main.py":
                         continue
                     destination = target_dir / item.name
+                    if destination.exists():
+                        saved = restore_dir / item.name
+                        if destination.is_dir():
+                            shutil.copytree(destination, saved)
+                        else:
+                            shutil.copy2(destination, saved)
+                        restore_items.append((destination, saved, destination.is_dir()))
                     if item.is_dir():
                         if destination.exists():
                             shutil.rmtree(destination)
@@ -288,8 +320,26 @@ def _execute_update(download_url, expected_sha256=""):
                         shutil.copy2(item, destination)
         except Exception:
             shutil.copy2(backup, _PLUGIN_FILE)
+            for destination, saved, was_dir in reversed(restore_items):
+                try:
+                    if destination.exists():
+                        if destination.is_dir():
+                            shutil.rmtree(destination)
+                        else:
+                            destination.unlink()
+                    if was_dir:
+                        shutil.copytree(saved, destination)
+                    else:
+                        shutil.copy2(saved, destination)
+                except Exception as restore_error:
+                    print(f"[WARN] 回滚 {destination.name} 失败: {restore_error}")
             raise
-        return {"ok": True, "message": f"插件已更新，已备份为 {backup.name}。请重启字字动画后生效。"}
+        return {
+            "ok": True,
+            "message": (
+                f"插件已更新到 {package_version}，已备份为 {backup.name}。请重启字字动画后生效。"
+            ),
+        }
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
     finally:
@@ -667,7 +717,11 @@ def handle_action(action, data=None):
         return _check_update_available()
     if action == "do_update":
         data = data or {}
-        return _execute_update(data.get("download_url", ""), data.get("sha256", ""))
+        return _execute_update(
+            data.get("download_url", ""),
+            data.get("sha256", ""),
+            data.get("remote_version", ""),
+        )
     if action == "check_points":
         params = get_params()
         api_key = (params.get("api_key") or "").strip()

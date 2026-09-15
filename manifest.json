@@ -2,10 +2,10 @@
   "plugins": [
     {
       "plugin_id": "video_plugin_youzan_aigc",
-      "version": "1.1.3",
-      "download_url": "https://cdn.jsdelivr.net/gh/609335334-rgb/youzan-aigc-plugin-updates@main/youzan-aigc-plugin-v1.1.3-20260915114558.zip",
-      "sha256": "c29384a86340dcedab0bae155d0616f8daeadbe27467616afb991b4f29e17f95",
-      "changelog": "修复长分镜提示词提交后找不到任务、误报失败的问题；素材导入并发超限（每账号2个）改为自动排队重试；参考音频超过分镜时长自动截断；新增素材会话复用、直链备份回退与中文错误提示。"
+      "version": "1.1.4",
+      "download_url": "https://cdn.jsdelivr.net/gh/609335334-rgb/youzan-aigc-plugin-updates@main/youzan-aigc-plugin-v1.1.4-20260915133803.zip",
+      "sha256": "903c19bac23bbef7f8f386e3deb2659c8b2407cc6d8305cf5e2a931179989446",
+      "changelog": ""
     }
   ]
 }

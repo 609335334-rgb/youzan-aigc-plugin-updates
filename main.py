@@ -39,7 +39,7 @@ from plugin_utils import load_plugin_config
 
 _PLUGIN_FILE = __file__
 _PLUGIN_ID = "video_plugin_youzan_aigc"
-_PLUGIN_VERSION = "1.1.3"
+_PLUGIN_VERSION = "1.1.4"
 _DEFAULT_UPDATE_MANIFEST_URL = (
     "https://cdn.jsdelivr.net/gh/609335334-rgb/"
     "youzan-aigc-plugin-updates@main/manifest.json"
@@ -94,9 +94,9 @@ RECOVERY_MAX_INTERVAL_SECONDS = 30  # 探测间隔逐步放大（5→10→20→3
 # 网关 /api/tasks 列表把 prompt 截断到 500 字符（仅用于展示），
 # 所以「按 prompt 找回任务」只能比对公共前缀，且前缀不能太短以免误配。
 HISTORY_PROMPT_MIN_PREFIX = 60
-# 网关素材会话复用（《AIGC 中转 API 调用文档》§7.6）：同一批素材在 30 分钟内重复生成时
-# 复用既有素材会话，避免重复导入素材（素材导入并发只有 2，重复导入最容易触发 429/408）。
-CONVERSATION_TTL_SECONDS = 30 * 60
+
+# 参考素材不复用：每次生成都由网关重新导入本分镜素材，不向网关传 conversationId，
+# 避免跨分镜复用素材会话导致串素材（文档 §7.6 的素材会话复用已停用）。
 
 # ---- 素材导入排队（官方/网关：素材导入并发每账号 2 个、全局 4，超限 429 WAN3_API_IMPORT_BUSY）----
 # 该状态代表任务未被网关受理、不扣积分：插件在本机做同样宽度的排队（同时只提交 2 个带素材的
@@ -336,7 +336,7 @@ _API_ERROR_HINTS = {
     "WAN3_API_MEDIA_DATA_INVALID": "Base64 素材数据无效，请重试或改用公网直链素材",
     "WAN3_API_MEDIA_INVALID": "media 素材数组结构非法（最多 20 条且每条必须带 url）",
     "WAN3_API_REFERENCE_MODE": "参考图模式取值非法，请在插件设置里改回默认参考图模式",
-    "WAN3_API_CONVERSATION_INVALID": "素材会话 ID 无效或不属于当前 Key，插件会自动新建会话重试",
+    "WAN3_API_CONVERSATION_INVALID": "素材会话 ID 无效或不属于当前 Key，插件不再复用素材会话，请重新提交本次生成",
     "WAN3_API_MENTIONS_INVALID": "提示词里的素材引用无效（如写了「图片3」但只传了 2 张图），请核对提示词与参考素材序号",
     "WAN3_API_MEDIA_DISK_LOW": "网关磁盘空间不足（507），请稍后重试或联系网关管理员",
     "WAN3_API_REQUEST_FAILED": "网关转发上游失败（502），稍后重试即可",
@@ -526,11 +526,7 @@ def _build_submit_error(response):
     return f"PLUGIN_ERROR:::{_describe_api_error(error_text)}"
 
 
-# ---------------------------------------------------------------- 素材会话复用
-
-_CONVERSATION_CACHE = {}
-_CONVERSATION_LOCK = threading.Lock()
-
+# ---------------------------------------------------------------- 素材导入排队
 
 _IMPORT_SEMAPHORE = threading.BoundedSemaphore(IMPORT_CONCURRENCY)
 
@@ -592,80 +588,6 @@ def _acquire_import_slot(deadline, cb=None):
     print(f"[排队] 等待素材导入名额超时（{int(time.time() - started)}s），改为直接提交")
     return False
 
-
-def _media_signature(reference_image, first_frame, last_frame, reference_videos, reference_audios):
-    """
-    生成参考素材指纹：同一批素材（含顺序）生成的多个分镜可复用同一个网关素材会话。
-
-    指纹包含素材顺序，避免提示词里的「图片1 / 图片2」映射到别的会话素材。
-    """
-    parts = []
-
-    def add(tag, value):
-        if value in (None, ""):
-            return
-        values = value if isinstance(value, (list, tuple)) else [value]
-        for item in values:
-            text = str(item or "").strip()
-            if text:
-                parts.append(f"{tag}:{text}")
-
-    add("image", reference_image)
-    add("first_frame", first_frame)
-    add("last_frame", last_frame)
-    add("video", reference_videos)
-    add("audio", reference_audios)
-    if not parts:
-        return ""
-    return hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()
-
-
-def _get_cached_conversation(signature):
-    if not signature:
-        return ""
-    now = time.time()
-    with _CONVERSATION_LOCK:
-        entry = _CONVERSATION_CACHE.get(signature)
-        if not entry:
-            return ""
-        conversation_id, created_at = entry
-        if now - created_at > CONVERSATION_TTL_SECONDS:
-            _CONVERSATION_CACHE.pop(signature, None)
-            return ""
-        return conversation_id
-
-
-def _remember_conversation(signature, conversation_id):
-    conversation_id = str(conversation_id or "").strip()
-    if not signature or not conversation_id:
-        return
-    with _CONVERSATION_LOCK:
-        _CONVERSATION_CACHE[signature] = (conversation_id, time.time())
-
-
-def _forget_conversation(signature):
-    if not signature:
-        return
-    with _CONVERSATION_LOCK:
-        _CONVERSATION_CACHE.pop(signature, None)
-
-
-def _lookup_conversation_id(base_url, api_key, task_id):
-    """网关只在任务历史里暴露 conversationId，生成成功后回读一次用于后续复用。"""
-    try:
-        recent = _fetch_recent_tasks(
-            base_url,
-            api_key,
-            int(time.time() * 1000) - 60 * 60 * 1000,
-            max_pages=2,
-        )
-    except Exception as exc:
-        print(f"[素材会话] 读取会话 ID 失败（不影响本次生成）: {exc}")
-        return ""
-    for task in recent:
-        if str(task.get("id") or "") == str(task_id):
-            return str(task.get("conversationId") or "")
-    return ""
 
 # ---------------------------------------------------------------- 参数
 
@@ -1506,28 +1428,11 @@ def _generate_impl(context):
     print(f"请求端点: {endpoint}")
     print(f"请求体: {json.dumps(payload, ensure_ascii=False)[:500]}")
 
-    # ---- 素材会话复用：同一批素材复用网关素材会话，避免重复导入（文档 §7.6）----
-    media_signature = _media_signature(
-        payload.get("reference_image"),
-        payload.get("first_frame"),
-        payload.get("last_frame"),
-        payload.get("reference_video"),
-        payload.get("reference_audio"),
-    )
-    conversation_id = ""
-    if media_signature:
-        conversation_id = _get_cached_conversation(media_signature)
-        if conversation_id:
-            payload["conversationId"] = conversation_id
-            print(f"素材会话复用: {conversation_id}")
-
     # ---- 提交任务（受理后进入轮询，绝不重复提交，避免重复任务扣双倍积分；
-    #       例外仅限网关明确「未受理、不扣积分」的场景：素材导入并发超限(429)、
-    #       复用的素材会话已失效(4xx)）----
+    #       例外仅限网关明确「未受理、不扣积分」的繁忙场景：素材并发超限(429)----
     task_id = None
     submit_started_ms = int(time.time() * 1000)
     busy_retry = 0
-    conversation_retried = False
     has_media = any(
         payload.get(key)
         for key in ("reference_image", "first_frame", "last_frame", "reference_video", "reference_audio")
@@ -1578,20 +1483,6 @@ def _generate_impl(context):
                 f"[WARN] {_submit_busy_reason(response)}：排队已超过 "
                 f"{SUBMIT_QUEUE_DEADLINE_SECONDS}s，不再等待"
             )
-
-        # 复用的素材会话已失效：清掉缓存、不带会话再提交一次
-        # （4xx = 网关未受理本次请求，不扣积分；不带会话重试可让网关自建新会话）
-        if (
-            conversation_id
-            and not conversation_retried
-            and response.status_code in (400, 404, 408, 409, 422)
-        ):
-            conversation_retried = True
-            _forget_conversation(media_signature)
-            payload.pop("conversationId", None)
-            conversation_id = ""
-            print("[WARN] 复用的素材会话已失效，改为新建素材会话后重新提交")
-            continue
 
         break
 
@@ -1646,11 +1537,6 @@ def _generate_impl(context):
                 remaining = result.get("remainingPoints")
                 if cost is not None or remaining is not None:
                     print(f"预估消耗积分: {cost}，剩余积分: {remaining}")
-                submitted_conversation = str(result.get("conversationId") or "").strip()
-                if submitted_conversation:
-                    conversation_id = submitted_conversation
-                    _remember_conversation(media_signature, submitted_conversation)
-
     print(f"任务 ID: {task_id}")
     if cb:
         cb("排队中")
@@ -1697,7 +1583,6 @@ def _generate_impl(context):
                     print(f"{last_poll_error}，将继续轮询")
                     continue
                 video_urls = candidates
-                _remember_conversation(media_signature, data.get("conversationId") or conversation_id)
                 if len(video_urls) > 1:
                     print(f"视频生成成功: {video_urls[0]}（另有 {len(video_urls) - 1} 条备用直链可回退）")
                 else:
@@ -1788,13 +1673,6 @@ def _generate_impl(context):
     print(f"视频已保存: {output_path}")
     print(f"文件大小: {size_mb:.2f} MB")
     print("=" * 60)
-
-    # 生成成功：回读任务历史里的素材会话 ID，供后续相同素材的分镜复用（不影响本次结果）
-    if media_signature and not _get_cached_conversation(media_signature):
-        _remember_conversation(
-            media_signature,
-            _lookup_conversation_id(base_url, api_key, task_id),
-        )
 
     if cb:
         cb("生成中", 100)

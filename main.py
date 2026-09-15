@@ -23,7 +23,9 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
+import uuid
 import mimetypes
 import zipfile
 from datetime import datetime
@@ -37,7 +39,7 @@ from plugin_utils import load_plugin_config
 
 _PLUGIN_FILE = __file__
 _PLUGIN_ID = "video_plugin_youzan_aigc"
-_PLUGIN_VERSION = "1.1.2"
+_PLUGIN_VERSION = "1.1.3"
 _DEFAULT_UPDATE_MANIFEST_URL = (
     "https://cdn.jsdelivr.net/gh/609335334-rgb/"
     "youzan-aigc-plugin-updates@main/manifest.json"
@@ -75,8 +77,33 @@ REF_MODE_COMMA = "comma"     # reference_image = "url1,url2"（逗号分隔，�
 REFERENCE_MODES = [REF_MODE_SINGLE, REF_MODE_ARRAY, REF_MODE_COMMA]
 
 MAX_IMAGE_REFS = 10
-MAX_AUDIO_REFS = 5  # 官方 Wan3.0：参考音频最多 5 段、单段 1-15 秒、总长 ≤15 秒
+MAX_AUDIO_REFS = 5  # 官方万相3.0：参考音频最多 5 段、单段 [1,15] 秒、总时长 ≤15 秒
+MAX_AUDIO_TOTAL_SECONDS = 15
+MAX_VIDEO_TOTAL_SECONDS = 15  # 官方万相3.0：参考视频最多 5 段、单段与总时长均 ≤15 秒
+MIN_MEDIA_SECONDS = 1
 MIN_POLL_INTERVAL = 10
+MAX_POLL_INTERVAL = 60  # 触发网关 IP 限流（约 20 次/分钟）时把轮询间隔放大到此值
+MAX_PROMPT_CHARS = 19000  # 网关上限（上游万相3.0 为 20000 字符，超限返回 WAN3_API_PROMPT_INVALID）
+
+# 提交响应丢失后的找回策略：网关先受理任务、再回写任务历史，实测存在上百秒延迟，
+# 因此按「5 秒探测一次、最长 5 分钟」的窗口持续找回，命中后继续轮询同一任务 ID。
+RECOVERY_DEADLINE_SECONDS = 300
+RECOVERY_INTERVAL_SECONDS = 5
+RECOVERY_MAX_INTERVAL_SECONDS = 30  # 探测间隔逐步放大（5→10→20→30s），避免触发 IP 限流
+
+# 网关 /api/tasks 列表把 prompt 截断到 500 字符（仅用于展示），
+# 所以「按 prompt 找回任务」只能比对公共前缀，且前缀不能太短以免误配。
+HISTORY_PROMPT_MIN_PREFIX = 60
+# 网关素材会话复用（《AIGC 中转 API 调用文档》§7.6）：同一批素材在 30 分钟内重复生成时
+# 复用既有素材会话，避免重复导入素材（素材导入并发只有 2，重复导入最容易触发 429/408）。
+CONVERSATION_TTL_SECONDS = 30 * 60
+
+# ---- 素材导入排队（官方/网关：素材导入并发每账号 2 个、全局 4，超限 429 WAN3_API_IMPORT_BUSY）----
+# 该状态代表任务未被网关受理、不扣积分：插件在本机做同样宽度的排队（同时只提交 2 个带素材的
+# 分镜），拿到名额前一直等待；拿不到时再按网关 429 退避重试，避免多分镜同时提交直接报错。
+IMPORT_CONCURRENCY = 2
+# 排队 + 退避重试的总时长上限；超过后才按错误提示交给用户处理。
+SUBMIT_QUEUE_DEADLINE_SECONDS = 600
 
 # 视频容器魔数（用于下载后校验）
 _WEBM_MAGIC = b"\x1a\x45\xdf\xa3"
@@ -288,6 +315,124 @@ def _extract_api_error(response):
         return f"HTTP {response.status_code}"
     return f"HTTP {response.status_code} - {text}"
 
+# 网关错误码 → 可操作中文提示（对照《AIGC 中转 API 调用文档》§6）
+_API_ERROR_HINTS = {
+    "WAN3_API_AUTH_REQUIRED": "API Key 无效或已过期，请在插件设置里重新填写中转 Key",
+    "WAN3_API_PERMISSION_DENIED": "当前 Key 没有该模型的权限，请联系网关管理员开通",
+    "WAN3_API_PROMPT_INVALID": "提示词为空或超过 19000 字符，请精简分镜提示词后重试",
+    "WAN3_API_MODEL_INVALID": "网关不支持该模型名，请在设置里点「刷新」重新选择模型",
+    "WAN3_API_IMPORT_BUSY": "参考素材导入并发超限（每账号 2 个），稍等几秒再生成",
+    "WAN3_API_MEDIA_URL_INVALID": "素材 URL 格式非法，请填写公网 http/https 直链",
+    "WAN3_API_MEDIA_URL_FORBIDDEN": "素材 URL 指向内网/本机或非标准端口，网关只接受公网地址",
+    "WAN3_API_MEDIA_DNS_FAILED": "素材域名解析失败，请检查链接是否可公网访问",
+    "WAN3_API_MEDIA_DOWNLOAD_FAILED": "网关下载素材失败（404 或不可访问），请确认链接有效",
+    "WAN3_API_MEDIA_FORMAT_INVALID": "素材真实格式与声明不符，请改用 JPG/PNG/WEBP/BMP",
+    "WAN3_API_MEDIA_FLATTEN_FAILED": "图片透明通道处理失败，请自行转成不带透明通道的 JPG",
+    "WAN3_API_REFERENCE_LIMIT": "参考素材数量超限（图 ≤10、视频 ≤5、音频 ≤5、合计 ≤20）",
+    "WAN3_API_MEDIA_TIMEOUT": "网关处理参考素材超时（单次上限 90 秒）：可减少同时生成的分镜数量、改用公网直链素材或精简参考图",
+    "WAN3_API_BODY_INVALID": "请求体结构错误（多为素材字段写法不对），请检查参考素材设置",
+    "WAN3_API_MEDIA_REDIRECT": "素材 URL 重定向到不允许的地址，请改用可直连的公网直链",
+    "WAN3_API_MEDIA_TOO_LARGE": "素材体积超限（图片 ≤20MB / 音频 ≤15MB），请先压缩后再提交",
+    "WAN3_API_MEDIA_DATA_INVALID": "Base64 素材数据无效，请重试或改用公网直链素材",
+    "WAN3_API_MEDIA_INVALID": "media 素材数组结构非法（最多 20 条且每条必须带 url）",
+    "WAN3_API_REFERENCE_MODE": "参考图模式取值非法，请在插件设置里改回默认参考图模式",
+    "WAN3_API_CONVERSATION_INVALID": "素材会话 ID 无效或不属于当前 Key，插件会自动新建会话重试",
+    "WAN3_API_MENTIONS_INVALID": "提示词里的素材引用无效（如写了「图片3」但只传了 2 张图），请核对提示词与参考素材序号",
+    "WAN3_API_MEDIA_DISK_LOW": "网关磁盘空间不足（507），请稍后重试或联系网关管理员",
+    "WAN3_API_REQUEST_FAILED": "网关转发上游失败（502），稍后重试即可",
+    "WAN3_API_REFERENCE_INVALID": "使用了网关不认的素材字段（url/link/filePath），请用插件的参考素材设置传入",
+    "EXTERNAL_MEDIA_URL_INSECURE": "图片 URL 必须是 HTTPS，请改用 https 直链",
+    "EXTERNAL_MEDIA_URL_BLOCKED": "图片 URL 指向本机/内网/保留地址，请换公网地址",
+    "EXTERNAL_MEDIA_URL_TOO_LONG": "图片 URL 超过 2048 字符，请改用短链",
+    "WAN3_CLIENT_MEDIA_FORBIDDEN": "使用了网关已停用的素材字段，请用插件的参考素材设置传入",
+    "WAN3_ASSET_INVALID": "素材未通过网关服务端校验，请更换素材后重试",
+    "TOKEN_QUOTA_EXCEEDED": "该 Key 的 Token 额度已用完，请充值或换 Key",
+    "DATAINSPECTIONFAILED": "提示词触发内容安全审核，请改写提示词后重试（积分会自动退回）",
+    "POINTS_NOT_ENOUGH": "积分不足，请先充值",
+    "PERMISSION_DENIED": "当前 Key 没有该模型/厂商权限，请联系网关管理员开通",
+    "AUTH_ERROR": "API Key 无效或已过期，请在插件设置里重新填写中转 Key",
+    "UPSTREAM_ERROR": "上游调用失败（502），稍后重试即可",
+    "SERVICE_UNAVAILABLE": "上游暂不可用（503），稍后重试即可",
+    "BILLING_ERROR": "网关计费不可用（503），请联系网关管理员",
+}
+
+
+def _describe_api_error(error_text):
+    """在网关原文后面补一条可操作提示；未命中已知错误码时原样返回。"""
+    text = str(error_text or "")
+    upper = text.upper()
+    for code, hint in _API_ERROR_HINTS.items():
+        if code in upper:
+            if hint in text:
+                return text
+            return f"{text}\n提示：{hint}"
+    return text
+
+
+def _normalize_prompt_text(text):
+    """统一换行符与首尾空白，避免历史记录里的换行差异导致匹配失败。"""
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    return normalized.strip()
+
+
+def _prompt_matches_history(stored_prompt, sent_prompt):
+    """
+    判断任务历史里的 prompt 是否为本次提交的 prompt。
+
+    网关 /api/tasks 列表把 prompt 截断到 500 字符用于展示，长提示词不可能与提交内容
+    完全相等；只要一方是另一方的完整前缀、且前缀长度足够，即视为同一个任务。
+    """
+    stored = _normalize_prompt_text(stored_prompt)
+    sent = _normalize_prompt_text(sent_prompt)
+    if not stored or not sent:
+        return False
+    if stored == sent:
+        return True
+    shorter, longer = (stored, sent) if len(stored) < len(sent) else (sent, stored)
+    return len(shorter) >= HISTORY_PROMPT_MIN_PREFIX and longer.startswith(shorter)
+
+
+def _task_created_at_ms(task):
+    try:
+        return int(task.get("createdAt"))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _fetch_recent_tasks(base_url, api_key, earliest_created_at, max_pages=4, page_size=50):
+    """
+    按时间倒序分页拉取近期任务，遇到早于 earliest_created_at 的记录即停止翻页。
+
+    历史列表按 createdAt 倒序返回，找回刚提交的任务通常一次请求就能命中，
+    比固定翻 5 页更快，也不会因为翻页过慢而错过任务。
+    """
+    history_url = _api_url(base_url, _TASKS_PATH)
+    collected = []
+    for page in range(1, max_pages + 1):
+        response = requests.get(
+            history_url,
+            headers={"Authorization": f"Bearer {api_key}"},
+            params={"page": page, "pageSize": page_size},
+            timeout=30,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(_extract_api_error(response))
+
+        data = response.json()
+        tasks = [task for task in (data.get("tasks") or []) if isinstance(task, dict)]
+        if not tasks:
+            break
+        collected.extend(tasks)
+
+        created_values = [
+            value for value in (_task_created_at_ms(task) for task in tasks) if value is not None
+        ]
+        if created_values and min(created_values) <= earliest_created_at:
+            break
+        if not data.get("hasMore"):
+            break
+    return collected
+
 
 def _recover_submitted_task_id(
     base_url,
@@ -295,52 +440,43 @@ def _recover_submitted_task_id(
     payload,
     submitted_at_ms,
     poll_interval=MIN_POLL_INTERVAL,
-    max_attempts=12,
+    deadline_seconds=RECOVERY_DEADLINE_SECONDS,
 ):
-    """提交响应丢失后，从任务历史中找回本次请求的任务 ID；绝不重复提交。"""
+    """
+    提交响应丢失后（读超时 / 504 / 非 JSON），从任务历史中找回本次请求的任务 ID。
+
+    网关是先受理任务、再回写任务历史的，响应超时并不代表任务没创建（积分也照扣）。
+    按 prompt + 模型 + 时间窗口找回任务 ID 后继续轮询，宿主软件才能拿到视频，
+    用户也不会因为看不到任务而重跑、重复扣积分。此函数绝不重复提交。
+    """
     expected_prompt = str(payload.get("prompt") or "")
     expected_model = str(payload.get("model") or "")
     if not expected_prompt or not expected_model:
         return None
 
-    history_url = _api_url(base_url, _TASKS_PATH)
     earliest_created_at = submitted_at_ms - 2 * 60 * 1000
+    interval = max(3, min(int(poll_interval or RECOVERY_INTERVAL_SECONDS), RECOVERY_INTERVAL_SECONDS))
+    deadline = time.time() + max(interval * 2, int(deadline_seconds))
     last_error = None
+    attempt = 0
 
-    for attempt in range(1, max_attempts + 1):
-        candidates = []
+    while True:
+        attempt += 1
         try:
-            for page in range(1, 6):
-                response = requests.get(
-                    history_url,
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    params={"page": page, "pageSize": 20},
-                    timeout=30,
-                )
-                if response.status_code != 200:
-                    last_error = _extract_api_error(response)
-                    break
-
-                data = response.json()
-                tasks = data.get("tasks") or []
-                for task in tasks:
-                    if not isinstance(task, dict) or not task.get("id"):
-                        continue
-                    if str(task.get("type") or "").lower() != "video":
-                        continue
-                    task_model = str(task.get("model") or task.get("modelName") or "")
-                    if task_model != expected_model or str(task.get("prompt") or "") != expected_prompt:
-                        continue
-                    try:
-                        created_at = int(task.get("createdAt"))
-                    except (TypeError, ValueError):
-                        continue
-                    if created_at < earliest_created_at:
-                        continue
-                    candidates.append((created_at, str(task["id"]), str(task.get("status") or "unknown")))
-
-                if not data.get("hasMore"):
-                    break
+            candidates = []
+            for task in _fetch_recent_tasks(base_url, api_key, earliest_created_at):
+                if not task.get("id") or str(task.get("type") or "").lower() != "video":
+                    continue
+                task_model = str(task.get("model") or task.get("modelName") or "")
+                if task_model != expected_model:
+                    continue
+                if not _prompt_matches_history(task.get("prompt"), expected_prompt):
+                    continue
+                created_at = _task_created_at_ms(task)
+                if created_at is None or created_at < earliest_created_at:
+                    continue
+                candidates.append((created_at, str(task["id"]), str(task.get("status") or "unknown")))
+            last_error = None
 
             if candidates:
                 # 优先取提交开始后创建且时间最近的任务，避免误认更早的同提示词任务。
@@ -354,20 +490,23 @@ def _recover_submitted_task_id(
                 delta_seconds = (created_at - submitted_at_ms) / 1000
                 print(
                     f"[提交恢复] 已从任务历史找回任务 ID: {task_id} "
-                    f"（状态: {status}，创建时间偏移: {delta_seconds:+.1f}s）"
+                    f"（状态: {status}，创建时间偏移: {delta_seconds:+.1f}s，第 {attempt} 次探测命中）"
                 )
                 return task_id
-        except (requests.exceptions.RequestException, ValueError, TypeError) as exc:
+        except (requests.exceptions.RequestException, ValueError, TypeError, RuntimeError) as exc:
             last_error = str(exc)
 
-        if attempt < max_attempts:
-            print(
-                f"[提交恢复] 暂未找到匹配任务，将继续查询 "
-                f"（{attempt}/{max_attempts}）: {last_error or '任务记录尚未同步'}"
-            )
-            time.sleep(max(MIN_POLL_INTERVAL, poll_interval))
+        if time.time() >= deadline:
+            break
 
-    print(f"[提交恢复] 未能找回任务 ID: {last_error or '没有匹配的近期任务'}")
+        print(
+            f"[提交恢复] 暂未找到匹配任务，{interval}s 后继续查询 "
+            f"（第 {attempt} 次: {last_error or '任务记录尚未同步'}）"
+        )
+        time.sleep(interval)
+        interval = min(interval * 2, RECOVERY_MAX_INTERVAL_SECONDS)
+
+    print(f"[提交恢复] 未能找回任务 ID（已探测 {attempt} 次）: {last_error or '没有匹配的近期任务'}")
     return None
 
 
@@ -384,8 +523,149 @@ def _build_submit_error(response):
             "可先换一张干净的图试生成，或改用文生视频确认模型可用；"
             "插件已自动对参考图做转 JPEG/限尺寸预处理）"
         )
-    return f"PLUGIN_ERROR:::{error_text}"
+    return f"PLUGIN_ERROR:::{_describe_api_error(error_text)}"
 
+
+# ---------------------------------------------------------------- 素材会话复用
+
+_CONVERSATION_CACHE = {}
+_CONVERSATION_LOCK = threading.Lock()
+
+
+_IMPORT_SEMAPHORE = threading.BoundedSemaphore(IMPORT_CONCURRENCY)
+
+
+def _is_submit_busy(response):
+    """
+    判断提交是否属于「未被网关受理、可安全退避重试」的繁忙场景：
+    素材导入并发超限（429 / WAN3_API_IMPORT_BUSY）、视频并发或账号/IP 限流（429）。
+    """
+    if getattr(response, "status_code", None) == 429:
+        return True
+    try:
+        text = str(getattr(response, "text", "") or "").upper()
+    except Exception:
+        return False
+    return "WAN3_API_IMPORT_BUSY" in text
+
+
+def _submit_busy_reason(response):
+    """把 429 / 繁忙响应细分出可读原因（网关文档 §6）。"""
+    text = str(getattr(response, "text", "") or "")
+    upper = text.upper()
+    if "WAN3_API_IMPORT_BUSY" in upper:
+        return f"参考素材导入并发超限（每账号 {IMPORT_CONCURRENCY} 个）"
+    if "TOKEN_QUOTA_EXCEEDED" in upper:
+        return "Key 的 Token 额度已用完"
+    if "CONCURRENCY" in upper or "并发" in text:
+        return "视频生成并发超限"
+    if getattr(response, "status_code", None) == 429:
+        return "网关限流（约 20 次/分钟、500 次/天/单 IP）"
+    return "网关繁忙"
+
+
+def _acquire_import_slot(deadline, cb=None):
+    """
+    本地素材导入排队：最多 IMPORT_CONCURRENCY 个带素材的分镜同时提交，与网关
+    「参考素材导入并发（每账号 2 个）」保持一致，避免同批分镜同时提交时互相挤爆报错。
+
+    排队期间打印进度并回报宿主；超过 deadline 仍未拿到名额时返回 False
+    （改为直接提交，由网关 429 退避重试兜底）。
+    """
+    if _IMPORT_SEMAPHORE.acquire(blocking=False):
+        return True
+    started = time.time()
+    while time.time() < deadline:
+        if _IMPORT_SEMAPHORE.acquire(timeout=1):
+            elapsed = int(time.time() - started)
+            if elapsed:
+                print(f"[排队] 已获得素材导入名额（本次等待 {elapsed}s）")
+            return True
+        elapsed = int(time.time() - started)
+        if elapsed and elapsed % 5 == 0:
+            print(
+                f"[排队] 素材导入并发已满（{IMPORT_CONCURRENCY}/{IMPORT_CONCURRENCY}），"
+                f"继续排队…（已等待 {elapsed}s）"
+            )
+            if cb:
+                cb(f"排队中（等待素材导入 {elapsed}s）")
+    print(f"[排队] 等待素材导入名额超时（{int(time.time() - started)}s），改为直接提交")
+    return False
+
+
+def _media_signature(reference_image, first_frame, last_frame, reference_videos, reference_audios):
+    """
+    生成参考素材指纹：同一批素材（含顺序）生成的多个分镜可复用同一个网关素材会话。
+
+    指纹包含素材顺序，避免提示词里的「图片1 / 图片2」映射到别的会话素材。
+    """
+    parts = []
+
+    def add(tag, value):
+        if value in (None, ""):
+            return
+        values = value if isinstance(value, (list, tuple)) else [value]
+        for item in values:
+            text = str(item or "").strip()
+            if text:
+                parts.append(f"{tag}:{text}")
+
+    add("image", reference_image)
+    add("first_frame", first_frame)
+    add("last_frame", last_frame)
+    add("video", reference_videos)
+    add("audio", reference_audios)
+    if not parts:
+        return ""
+    return hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def _get_cached_conversation(signature):
+    if not signature:
+        return ""
+    now = time.time()
+    with _CONVERSATION_LOCK:
+        entry = _CONVERSATION_CACHE.get(signature)
+        if not entry:
+            return ""
+        conversation_id, created_at = entry
+        if now - created_at > CONVERSATION_TTL_SECONDS:
+            _CONVERSATION_CACHE.pop(signature, None)
+            return ""
+        return conversation_id
+
+
+def _remember_conversation(signature, conversation_id):
+    conversation_id = str(conversation_id or "").strip()
+    if not signature or not conversation_id:
+        return
+    with _CONVERSATION_LOCK:
+        _CONVERSATION_CACHE[signature] = (conversation_id, time.time())
+
+
+def _forget_conversation(signature):
+    if not signature:
+        return
+    with _CONVERSATION_LOCK:
+        _CONVERSATION_CACHE.pop(signature, None)
+
+
+def _lookup_conversation_id(base_url, api_key, task_id):
+    """网关只在任务历史里暴露 conversationId，生成成功后回读一次用于后续复用。"""
+    try:
+        recent = _fetch_recent_tasks(
+            base_url,
+            api_key,
+            int(time.time() * 1000) - 60 * 60 * 1000,
+            max_pages=2,
+        )
+    except Exception as exc:
+        print(f"[素材会话] 读取会话 ID 失败（不影响本次生成）: {exc}")
+        return ""
+    for task in recent:
+        if str(task.get("id") or "") == str(task_id):
+            return str(task.get("conversationId") or "")
+    return ""
 
 # ---------------------------------------------------------------- 参数
 
@@ -524,6 +804,16 @@ def _extract_path_value(value):
     return str(value or "").strip()
 
 
+def _preview_media(value, limit=96):
+    """日志里只显示素材值的前若干字符，避免把整段 base64 参考图写进宿主日志。"""
+    if isinstance(value, (list, tuple)):
+        return [_preview_media(item, limit) for item in value]
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}…（共 {len(text)} 字符）"
+
+
 def _log_media_sources(context):
     """诊断日志：确认宿主把分镜素材放进了哪些 context 键（文件名摘要）。"""
     def _brief(v):
@@ -538,7 +828,7 @@ def _log_media_sources(context):
     print(f"[素材诊断] reference_images={_brief(context.get('reference_images'))}")
     print(f"[素材诊断] reference_audios={_brief(context.get('reference_audios'))}")
     print(f"[素材诊断] reference_items={_brief(context.get('reference_items'))}")
-    print(f"[素材诊断] audio_path={context.get('audio_path')}")
+    print(f"[素材诊断] audio_path={_preview_media(context.get('audio_path'))}")
 
 
 def _collect_image_references(context, max_count=MAX_IMAGE_REFS):
@@ -760,26 +1050,75 @@ def _looks_like_video(content):
     return False
 
 
-def _extract_video_url(data):
-    """兼容网关不同版本的结果包装，提取视频直链。"""
+def _extract_video_url_candidates(data):
+    """
+    兼容网关不同版本的结果包装，按优先级返回候选直链：
+    上游直链（url）优先、网关备份副本（backupUrl）兜底，前者失效时可自动回退。
+    """
     if not isinstance(data, dict):
-        return None
-    for key in ("url", "video_url", "videoUrl", "download_url", "downloadUrl"):
-        value = data.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
+        return []
+
+    candidates = []
+
+    def add(value):
+        if not isinstance(value, str):
+            return
+        text = value.strip()
+        if not text or not text.startswith(("http://", "https://")):
+            return
+        if text not in candidates:
+            candidates.append(text)
+
+    for key in ("url", "directUrl", "direct_url", "video_url", "videoUrl", "download_url", "downloadUrl"):
+        add(data.get(key))
+    for key in ("backupUrl", "backup_url", "backupURL"):
+        add(data.get(key))
     for key in ("result", "data", "output", "video"):
         nested = data.get(key)
         if isinstance(nested, dict):
-            url = _extract_video_url(nested)
-            if url:
-                return url
+            for url in _extract_video_url_candidates(nested):
+                add(url)
         elif isinstance(nested, list):
             for item in nested:
-                url = _extract_video_url(item)
-                if url:
-                    return url
-    return None
+                for url in _extract_video_url_candidates(item):
+                    add(url)
+    return candidates
+
+
+def _extract_video_url(data):
+    """兼容旧调用：返回优先级最高的视频直链。"""
+    candidates = _extract_video_url_candidates(data)
+    return candidates[0] if candidates else None
+
+
+def _download_video_content(url, base_url, api_key, timeout, attempts=4):
+    """下载直链内容；429/502/503/504 与网络异常按指数退避重试，最终失败时抛异常。"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+    }
+    if str(url).startswith(base_url):
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    last_error = "未知错误"
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            time.sleep(2 ** attempt)
+        try:
+            response = requests.get(url, headers=headers, timeout=timeout)
+        except requests.exceptions.RequestException as exc:
+            last_error = f"网络异常: {exc}"
+            print(f"[WARN] 视频下载网络异常: {exc}，稍后重试（{attempt}/{attempts}）")
+            continue
+        if response.status_code == 200:
+            return response.content
+        last_error = f"HTTP {response.status_code} - {response.text[:200]}"
+        if response.status_code in _RETRYABLE_STATUS_CODES:
+            print(f"[WARN] 视频下载返回 {response.status_code}，稍后重试（{attempt}/{attempts}）")
+            continue
+        break
+    raise Exception(f"直链下载失败（最多尝试 {attempts} 次）: {last_error}")
 
 
 def _extract_fail_reason(data):
@@ -790,42 +1129,153 @@ def _extract_fail_reason(data):
         return str(data)
 
 
-def _probe_audio_duration(file_path):
-    """用 ffmpeg 探测本地音频时长（秒，浮点）；失败返回 None（不阻断，仅告警）。"""
-    import subprocess
+def _find_ffmpeg():
+    """定位随软件附带的 ffmpeg；都找不到时返回 None（不阻断生成）。"""
     candidates = [
         r"E:\字字动画\resources\ffmpeg\bin\ffmpeg.exe",
         r"D:\字字动画\resources\ffmpeg\bin\ffmpeg.exe",
         "ffmpeg",
     ]
-    for ff in candidates:
-        try:
-            proc = subprocess.run(
-                [ff, "-i", file_path],
-                capture_output=True, timeout=15,
-            )
-            # ffmpeg -i 不带输出参数时信息在 stderr
-            text = (proc.stderr or b"").decode("utf-8", errors="ignore")
-            import re
-            m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", text)
-            if m:
-                h, mnt, sec = int(m.group(1)), int(m.group(2)), float(m.group(3))
-                return h * 3600 + mnt * 60 + sec
-        except Exception:
-            continue
+    for candidate in candidates:
+        if os.path.sep in candidate:
+            if os.path.exists(candidate):
+                return candidate
+        elif shutil.which(candidate):
+            return candidate
     return None
 
 
-def _resolve_audio_reference_url(text, timeout=60):
-    """公网音频 URL 原样透传；本地音频自动上传 Uguu。"""
-    text = str(text or "").strip()
-    if not text:
-        return ""
-    if text.startswith(("http://", "https://")):
-        return text
-    if os.path.exists(text):
-        return _upload_media_to_uguu(text, timeout=timeout)
-    raise Exception(f"PLUGIN_ERROR:::音频参考 URL 非法或本地文件不存在: {text}")
+def _probe_media_duration(file_path):
+    """用 ffmpeg 探测本地音频/视频时长（秒，浮点）；失败返回 None（不阻断，仅告警）。"""
+    import subprocess
+    ffmpeg = _find_ffmpeg()
+    if not ffmpeg or not file_path:
+        return None
+    try:
+        proc = subprocess.run([ffmpeg, "-i", str(file_path)], capture_output=True, timeout=15)
+    except Exception:
+        return None
+    # ffmpeg -i 不带输出参数时信息在 stderr
+    text = (proc.stderr or b"").decode("utf-8", errors="ignore")
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", text)
+    if not match:
+        return None
+    hours, minutes, seconds = int(match.group(1)), int(match.group(2)), float(match.group(3))
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def _trim_media_file(file_path, seconds, timeout=60):
+    """
+    用 ffmpeg 把本地音频截断到 seconds 秒，返回截断后的文件路径。
+
+    参考音频只用前几秒即可（视频本身只有 N 秒），截断后即可满足官方「单段/总长 ≤15 秒」限制。
+    截断失败时返回原路径（继续上传，不阻断生成）。
+    """
+    import subprocess
+    ffmpeg = _find_ffmpeg()
+    if not ffmpeg or not seconds or seconds <= 0:
+        return file_path
+    extension = (os.path.splitext(file_path)[1] or ".mp3").lower()
+    codec_attempts = [["-c", "copy"]]
+    if extension == ".mp3":
+        codec_attempts.append(["-c:a", "libmp3lame", "-b:a", "128k"])
+    elif extension == ".wav":
+        codec_attempts.append(["-c:a", "pcm_s16le"])
+    else:
+        codec_attempts.append(["-c:a", "aac", "-b:a", "128k"])
+
+    temp_dir = tempfile.mkdtemp(prefix="zz_audio_trim_")
+    stem = os.path.splitext(os.path.basename(file_path))[0]
+    for index, codec_args in enumerate(codec_attempts):
+        output_path = os.path.join(temp_dir, f"{stem}_trim{index}{extension}")
+        try:
+            proc = subprocess.run(
+                [ffmpeg, "-y", "-i", str(file_path), "-t", f"{float(seconds):.3f}",
+                 "-vn", *codec_args, output_path],
+                capture_output=True, timeout=timeout,
+            )
+        except Exception:
+            continue
+        if proc.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            print(
+                f"[音频] 已截断到 {float(seconds):.1f}s: {os.path.basename(file_path)}"
+                f" -> {os.path.getsize(output_path) // 1024}KB"
+            )
+            return output_path
+    print(f"[WARN] 音频截断失败，改用原始文件（网关可能因超长报错）: {os.path.basename(file_path)}")
+    return file_path
+
+
+def _audio_keep_seconds(duration_seconds, used_seconds,
+                        segment_limit=MAX_AUDIO_TOTAL_SECONDS,
+                        max_total_seconds=MAX_AUDIO_TOTAL_SECONDS):
+    """
+    官方万相3.0 参考音频限制：单段 [1,15] 秒、总时长 ≤15 秒。
+
+    返回该段音频应保留的秒数；返回 None 表示这段放不下
+    （剩余额度不足 1 秒，或音频本身短于 1 秒）。
+    """
+    remaining = max_total_seconds - max(0.0, used_seconds or 0.0)
+    if remaining < MIN_MEDIA_SECONDS:
+        return None
+    limit = min(segment_limit, remaining)
+    if duration_seconds is None:
+        return limit
+    if duration_seconds < MIN_MEDIA_SECONDS:
+        return None
+    return min(duration_seconds, limit)
+
+
+def _prepare_audio_references(sources, timeout=60, segment_limit=MAX_AUDIO_TOTAL_SECONDS,
+                              max_total_seconds=MAX_AUDIO_TOTAL_SECONDS,
+                              max_count=MAX_AUDIO_REFS):
+    """
+    按官方万相3.0 规则准备参考音频 URL：最多 5 段、单段 [1,15] 秒、总时长 ≤15 秒。
+
+    · 本地音频先探测时长，超过可用额度（= min(15 秒, 本镜输出时长)）时用 ffmpeg 截断再上传；
+    · 按顺序累计总时长，某段会突破总上限时截断到剩余额度，剩余不足 1 秒才丢弃该段；
+    · 公网 URL 音频无法探测/截断，原样保留（真超限由网关报错，插件会给出中文提示）。
+    """
+    urls = []
+    used = 0.0
+    for source in sources:
+        text = str(source or "").strip()
+        if not text or text in urls:
+            continue
+        if text.startswith(("http://", "https://")):
+            if len(urls) < max_count:
+                urls.append(text)
+            continue
+        if not os.path.exists(text):
+            raise Exception(f"PLUGIN_ERROR:::音频参考 URL 非法或本地文件不存在: {text}")
+        if len(urls) >= max_count:
+            print(f"[WARN] 参考音频最多 {max_count} 段（官方限制），已忽略其余素材")
+            break
+
+        seconds = _probe_media_duration(text)
+        keep = _audio_keep_seconds(seconds, used, segment_limit, max_total_seconds)
+        name = os.path.basename(text)
+        if keep is None:
+            duration_text = f"{seconds:.1f}s" if seconds is not None else "未知"
+            print(f"[WARN] 参考音频 {name} 已跳过（时长 {duration_text}，可用额度不足 {MIN_MEDIA_SECONDS}s）")
+            continue
+
+        upload_path = text
+        if seconds is not None and seconds > keep + 0.05:
+            print(f"[音频] {name} 时长 {seconds:.1f}s 超过本次可用 {keep:.1f}s，自动截断后再上传")
+            upload_path = _trim_media_file(text, keep, timeout=timeout)
+        url = _upload_media_to_uguu(upload_path, timeout=timeout)
+        if url in urls:
+            continue
+        urls.append(url)
+        used += keep if seconds is not None else 0.0
+
+    if urls:
+        print(
+            f"[音频] 参考音频 {len(urls)} 段，已知本地音频合计 {used:.1f}s"
+            f"（官方单段/总长上限 {max_total_seconds}s）"
+        )
+    return urls
 
 
 def _collect_storyboard_audios(context):
@@ -918,8 +1368,8 @@ def _generate_impl(context):
     max_poll_attempts = int(params.get("max_poll_attempts") or 300)
 
     # 时长：优先取分镜时长，其次取插件设置
-    # Wan3.0 官方支持范围 5-15 秒（实测 1 秒必 400 WAN3_PARAMETER_INVALID，2 秒可生成）；
-    # 这里放宽为 2-15 秒并提示，超范围直接按边界取值，避免提交被网关拒。
+    # 官方万相3.0：无视频输入时 duration 取 [2, 30]（默认 5，-1 为智能时长）；
+    # 有参考视频时「输入视频总时长 + 输出时长 ≤30」。超范围按边界取值并提示，避免提交被拒。
     scene_duration = context.get("scene_duration")
     try:
         duration = int(scene_duration) if scene_duration else int(params.get("duration") or _DEFAULT_DURATION)
@@ -980,7 +1430,7 @@ def _generate_impl(context):
                     reference_image = ",".join(reference_image_urls)
                 else:
                     reference_image = reference_image_urls[0]
-        print(f"参考图: {reference_image}")
+        print(f"参考图: {_preview_media(reference_image)}")
     else:
         print("模式: 文生视频")
 
@@ -1013,24 +1463,41 @@ def _generate_impl(context):
             raise Exception("PLUGIN_ERROR:::已开启音频参考但未填写音频 URL")
         audio_sources.extend(re.split(r"[\n,;]+", manual_text))
     if audio_sources:
-        audio_urls = []
-        for chunk in audio_sources:
-            chunk = str(chunk or "").strip()
-            if not chunk:
-                continue
-            resolved = _resolve_audio_reference_url(chunk, timeout=params.get("timeout") or 60)
-            if resolved and resolved not in audio_urls:
-                audio_urls.append(resolved)
-        if len(audio_urls) > MAX_AUDIO_REFS:
-            print(f"[WARN] 音频参考最多 {MAX_AUDIO_REFS} 段（官方限制），已截断")
-            audio_urls = audio_urls[:MAX_AUDIO_REFS]
+        # 单段可用额度 = min(官方 15 秒, 本镜输出时长)：视频只有 duration 秒，更长的参考音频没有意义
+        audio_urls = _prepare_audio_references(
+            audio_sources,
+            timeout=params.get("timeout") or 60,
+            segment_limit=min(MAX_AUDIO_TOTAL_SECONDS, duration),
+        )
         if audio_urls:
             payload["reference_audio"] = audio_urls
             print(f"音频参考(reference_audio): {audio_urls}")
 
+    # ---- 官方万相3.0「素材组合」规则：first_frame / last_frame 与 reference_image /
+    #      reference_video / reference_audio 互斥，混用会被上游拒绝（任务直接失败）。
+    #      本插件以「参考图」为主流程、首尾帧很少用，因此两者同时出现时保留参考素材、
+    #      丢弃首/尾帧，避免整条分镜因为组合非法而报错。----
+    if (payload.get("first_frame") or payload.get("last_frame")) and any(
+        payload.get(key) for key in ("reference_image", "reference_video", "reference_audio")
+    ):
+        dropped = [key for key in ("first_frame", "last_frame") if payload.pop(key, None)]
+        print(
+            "[WARN] 首帧/尾帧与参考素材互斥（官方万相3.0 规则），本插件以参考素材为主，"
+            f"已忽略: {'、'.join(dropped)}（如需用首尾帧，请不要同时挂参考图/视频/音频）"
+        )
+
+    if len(prompt) > MAX_PROMPT_CHARS:
+        print(
+            f"[WARN] 提示词 {len(prompt)} 字符超过网关上限 {MAX_PROMPT_CHARS}"
+            "（上游万相3.0 为 20000 字符），网关会返回 WAN3_API_PROMPT_INVALID，请精简分镜提示词"
+        )
+
+    # 幂等键：网关支持 Idempotency-Key（1-128 位 ASCII），同一次生成的退避重试复用同一个值
+    idempotency_key = "zz-" + uuid.uuid4().hex
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
+        "Idempotency-Key": idempotency_key,
     }
     endpoint = _api_url(base_url, _VIDEO_GENERATIONS_PATH)
 
@@ -1039,26 +1506,94 @@ def _generate_impl(context):
     print(f"请求端点: {endpoint}")
     print(f"请求体: {json.dumps(payload, ensure_ascii=False)[:500]}")
 
-    # ---- 提交任务（只提交一次：受理后进入轮询，绝不重试提交，避免重复任务扣双倍积分；
-    #       重试只允许发生在传参/素材上传阶段）----
+    # ---- 素材会话复用：同一批素材复用网关素材会话，避免重复导入（文档 §7.6）----
+    media_signature = _media_signature(
+        payload.get("reference_image"),
+        payload.get("first_frame"),
+        payload.get("last_frame"),
+        payload.get("reference_video"),
+        payload.get("reference_audio"),
+    )
+    conversation_id = ""
+    if media_signature:
+        conversation_id = _get_cached_conversation(media_signature)
+        if conversation_id:
+            payload["conversationId"] = conversation_id
+            print(f"素材会话复用: {conversation_id}")
+
+    # ---- 提交任务（受理后进入轮询，绝不重复提交，避免重复任务扣双倍积分；
+    #       例外仅限网关明确「未受理、不扣积分」的场景：素材导入并发超限(429)、
+    #       复用的素材会话已失效(4xx)）----
     task_id = None
     submit_started_ms = int(time.time() * 1000)
-    try:
-        response = requests.post(endpoint, headers=headers, json=payload, timeout=timeout)
-    except requests.exceptions.RequestException as exc:
-        print(f"[WARN] 提交任务网络异常，开始从任务历史找回任务 ID: {exc}")
-        task_id = _recover_submitted_task_id(
-            base_url,
-            api_key,
-            payload,
-            submit_started_ms,
-            poll_interval=poll_interval,
-        )
-        if not task_id:
-            raise Exception(
-                f"PLUGIN_ERROR:::提交任务网络异常: {exc}（已自动查询任务历史但未找到匹配任务。"
-                "请到「我的任务」确认任务状态，勿立即重复生成，以免重复扣积分）"
-            ) from exc
+    busy_retry = 0
+    conversation_retried = False
+    has_media = any(
+        payload.get(key)
+        for key in ("reference_image", "first_frame", "last_frame", "reference_video", "reference_audio")
+    )
+    queue_deadline = time.time() + SUBMIT_QUEUE_DEADLINE_SECONDS
+    while True:
+        # ---- 本地素材导入排队：同时只提交 IMPORT_CONCURRENCY 个带素材的分镜 ----
+        held_slot = False
+        if has_media:
+            held_slot = _acquire_import_slot(queue_deadline, cb)
+        try:
+            response = requests.post(endpoint, headers=headers, json=payload, timeout=timeout)
+        except requests.exceptions.RequestException as exc:
+            if held_slot:
+                _IMPORT_SEMAPHORE.release()
+            print(f"[WARN] 提交任务网络异常，开始从任务历史找回任务 ID: {exc}")
+            task_id = _recover_submitted_task_id(
+                base_url,
+                api_key,
+                payload,
+                submit_started_ms,
+                poll_interval=poll_interval,
+            )
+            if not task_id:
+                raise Exception(
+                    f"PLUGIN_ERROR:::提交任务网络异常: {exc}（已自动查询任务历史但未找到匹配任务。"
+                    "请到「我的任务」确认任务状态，勿立即重复生成，以免重复扣积分）"
+                ) from exc
+            break
+
+        if held_slot:
+            _IMPORT_SEMAPHORE.release()
+
+        # 网关繁忙/限流（429 等）：任务未被受理、不扣积分，可安全排队后重试
+        if _is_submit_busy(response):
+            if time.time() < queue_deadline:
+                busy_retry += 1
+                delay = min(2 ** min(busy_retry, 4) * 2, 30)
+                print(
+                    f"[WARN] {_submit_busy_reason(response)}，{delay}s 后重新提交"
+                    f"（第 {busy_retry} 次，任务未受理、不扣积分）"
+                )
+                if cb:
+                    cb("排队中")
+                time.sleep(delay)
+                continue
+            print(
+                f"[WARN] {_submit_busy_reason(response)}：排队已超过 "
+                f"{SUBMIT_QUEUE_DEADLINE_SECONDS}s，不再等待"
+            )
+
+        # 复用的素材会话已失效：清掉缓存、不带会话再提交一次
+        # （4xx = 网关未受理本次请求，不扣积分；不带会话重试可让网关自建新会话）
+        if (
+            conversation_id
+            and not conversation_retried
+            and response.status_code in (400, 404, 408, 409, 422)
+        ):
+            conversation_retried = True
+            _forget_conversation(media_signature)
+            payload.pop("conversationId", None)
+            conversation_id = ""
+            print("[WARN] 复用的素材会话已失效，改为新建素材会话后重新提交")
+            continue
+
+        break
 
     if not task_id:
         # 200/202 均视为提交成功（202 Accepted = 任务已受理）
@@ -1111,6 +1646,10 @@ def _generate_impl(context):
                 remaining = result.get("remainingPoints")
                 if cost is not None or remaining is not None:
                     print(f"预估消耗积分: {cost}，剩余积分: {remaining}")
+                submitted_conversation = str(result.get("conversationId") or "").strip()
+                if submitted_conversation:
+                    conversation_id = submitted_conversation
+                    _remember_conversation(media_signature, submitted_conversation)
 
     print(f"任务 ID: {task_id}")
     if cb:
@@ -1119,11 +1658,12 @@ def _generate_impl(context):
     # ---- 轮询任务状态 ----
     poll_url = _api_url(base_url, _VIDEO_STATUS_PATH.format(task_id=task_id))
     attempts = 0
-    video_url = None
+    video_urls = []
     last_poll_error = None
     failed_streak = 0
+    poll_delay = poll_interval
     while attempts < max_poll_attempts:
-        time.sleep(poll_interval)
+        time.sleep(poll_delay)
         attempts += 1
         try:
             response = requests.get(
@@ -1133,6 +1673,10 @@ def _generate_impl(context):
             )
             if response.status_code != 200:
                 last_poll_error = f"HTTP {response.status_code}: {response.text[:200]}"
+                # 429 = 网关 IP 限流（约 20 次/分钟）：放大轮询间隔，避免雪上加霜
+                if response.status_code == 429:
+                    poll_delay = min(poll_delay * 2, MAX_POLL_INTERVAL)
+                    print(f"[WARN] 轮询被网关限流（429），下次间隔放宽到 {poll_delay}s")
                 print(f"状态查询失败，将继续轮询: {last_poll_error}")
                 continue
 
@@ -1142,16 +1686,22 @@ def _generate_impl(context):
                 last_poll_error = f"状态查询返回非 JSON: {response.text[:200]}"
                 print(f"{last_poll_error}，将继续轮询")
                 continue
+            poll_delay = poll_interval
             status = str(data.get("status") or "unknown").lower()
 
             if status in {"success", "succeeded", "completed", "complete", "done"}:
                 failed_streak = 0
-                video_url = _extract_video_url(data)
-                if not video_url:
+                candidates = _extract_video_url_candidates(data)
+                if not candidates:
                     last_poll_error = "网关报告成功但暂未返回视频链接"
                     print(f"{last_poll_error}，将继续轮询")
                     continue
-                print(f"视频生成成功: {video_url}")
+                video_urls = candidates
+                _remember_conversation(media_signature, data.get("conversationId") or conversation_id)
+                if len(video_urls) > 1:
+                    print(f"视频生成成功: {video_urls[0]}（另有 {len(video_urls) - 1} 条备用直链可回退）")
+                else:
+                    print(f"视频生成成功: {video_urls[0]}")
                 break
 
             if status in {"refunded", "refund", "refunded_failed"}:
@@ -1161,7 +1711,7 @@ def _generate_impl(context):
 
             if status in {"failed", "failure", "fail", "error"}:
                 reason = _extract_fail_reason(data)
-                raise Exception(f"PLUGIN_ERROR:::视频任务失败: {reason}")
+                raise Exception(f"PLUGIN_ERROR:::视频任务失败: {_describe_api_error(reason)}")
 
             failed_streak = 0
 
@@ -1187,7 +1737,7 @@ def _generate_impl(context):
             traceback.print_exc()
             print(f"状态查询异常，将继续轮询: {exc}")
 
-    if not video_url:
+    if not video_urls:
         error_suffix = f" 最近一次查询异常: {last_poll_error}。" if last_poll_error else ""
         raise Exception(
             f"PLUGIN_ERROR:::等待生成超时（已查询 {max_poll_attempts} 次），视频尚未完成。"
@@ -1195,40 +1745,25 @@ def _generate_impl(context):
             "可在高级设置中增大「最长等待」后重试"
         )
 
-    # ---- 下载并校验 ----
+    # ---- 下载并校验（主直链失败时回退到网关备份副本 backupUrl）----
     if cb:
         cb("下载中", 95)
-    print(f"正在下载视频: {video_url}")
 
-    download_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "*/*",
-    }
-    if str(video_url).startswith(base_url):
-        download_headers["Authorization"] = f"Bearer {api_key}"
-
-    video_response = None
-    video_error = None
-    for dl_attempt in range(4):
-        if dl_attempt > 0:
-            time.sleep(2 ** dl_attempt)
+    content = None
+    download_errors = []
+    for index, candidate in enumerate(video_urls, start=1):
+        print(f"正在下载视频: {candidate}")
         try:
-            video_response = requests.get(video_url, headers=download_headers, timeout=timeout)
-            if video_response.status_code in _RETRYABLE_STATUS_CODES:
-                video_error = f"HTTP {video_response.status_code}"
-                print(f"[WARN] 视频下载返回 {video_response.status_code}，{2 ** (dl_attempt + 1)}s 后重试（{dl_attempt + 1}/3）")
-                continue
-            if video_response.status_code != 200:
-                raise Exception(f"PLUGIN_ERROR:::下载视频失败: HTTP {video_response.status_code} - {video_response.text}")
+            content = _download_video_content(candidate, base_url, api_key, timeout)
             break
-        except requests.exceptions.RequestException as exc:
-            video_error = str(exc)
-            print(f"[WARN] 视频下载网络异常: {exc}，{2 ** (dl_attempt + 1)}s 后重试（{dl_attempt + 1}/3）")
-    if video_response is None or video_response.status_code != 200:
-        raise Exception(f"PLUGIN_ERROR:::下载视频失败（已重试 3 次）: {video_error}")
+        except Exception as exc:
+            download_errors.append(f"第 {index} 条直链 {exc}")
+            if index < len(video_urls):
+                print(f"[WARN] 下载失败，改用备用直链重试: {exc}")
+            content = None
 
-    content = video_response.content
+    if content is None:
+        raise Exception("PLUGIN_ERROR:::下载视频失败: " + "；".join(download_errors))
     if not content or len(content) < 1024:
         raise Exception("PLUGIN_ERROR:::下载结果为空或文件过小，不是有效视频")
     if not _looks_like_video(content):
@@ -1253,6 +1788,13 @@ def _generate_impl(context):
     print(f"视频已保存: {output_path}")
     print(f"文件大小: {size_mb:.2f} MB")
     print("=" * 60)
+
+    # 生成成功：回读任务历史里的素材会话 ID，供后续相同素材的分镜复用（不影响本次结果）
+    if media_signature and not _get_cached_conversation(media_signature):
+        _remember_conversation(
+            media_signature,
+            _lookup_conversation_id(base_url, api_key, task_id),
+        )
 
     if cb:
         cb("生成中", 100)

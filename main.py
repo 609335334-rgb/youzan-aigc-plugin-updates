@@ -39,7 +39,7 @@ from plugin_utils import load_plugin_config
 
 _PLUGIN_FILE = __file__
 _PLUGIN_ID = "video_plugin_youzan_aigc"
-_PLUGIN_VERSION = "1.1.5"
+_PLUGIN_VERSION = "1.1.6"
 _DEFAULT_UPDATE_MANIFEST_URL = (
     "https://cdn.jsdelivr.net/gh/609335334-rgb/"
     "youzan-aigc-plugin-updates@main/manifest.json"
@@ -563,6 +563,13 @@ def _recover_submitted_task_id(
 # 上游对参考素材做安全校验时的典型错误关键词
 _REFERENCE_REJECTION_KEYWORDS = ("引用素材", "参考图", "安全校验", "素材未通过", "image check", "safety")
 
+# PNG 参考图统一拒绝：不做静默转码，直接让用户先转成 JPG
+_PNG_REFERENCE_HINT = (
+    "不支持 PNG 格式，请先转成 JPG 再提交"
+    "（带透明通道的图请先合上白色或其他实底背景再转 JPG）；"
+    "也可以在高级设置的「参考图 URL」中填写 JPG 公网直链。"
+)
+
 
 def _build_submit_error(response):
     """把提交失败转成 PLUGIN_ERROR；参考素材被拒时附上排查提示。"""
@@ -571,7 +578,7 @@ def _build_submit_error(response):
         error_text += (
             "（排查提示：多为参考图内容或尺寸触发上游安全校验。"
             "可先换一张干净的图试生成，或改用文生视频确认模型可用；"
-            "插件已自动对参考图做转 JPEG/限尺寸预处理）"
+            "插件已对参考图做限尺寸预处理，但 PNG 需自行先转成 JPG）"
         )
     return f"PLUGIN_ERROR:::{_describe_api_error(error_text)}"
 
@@ -960,10 +967,11 @@ def _convert_image_to_jpeg(image, max_side=2048, quality=92, max_bytes=8 * 1024 
 
 def _preprocess_reference_image(image_path, max_side=2048, quality=92, max_bytes=8 * 1024 * 1024):
     """
-    参考图预处理：统一转 JPEG、限最长边、压体积、去掉 alpha 通道，返回临时 .jpg 路径。
+    参考图预处理：非 PNG 图片统一转 JPEG、限最长边、压体积，返回临时 .jpg 路径。
 
-    上游安全校验对参考图的格式 / 尺寸 / 体积较敏感（部分模型不支持 PNG），
-    先规范化可排除「PNG / 透明通道 / 过大 / 非标准格式」导致的拒检。
+    上游安全校验对参考图的格式 / 尺寸 / 体积较敏感，
+    先规范化可排除「过大 / 非标准格式」导致的拒检。
+    PNG 在进入本函数前就被 _resolve_reference_image_url 直接拒绝，此处不做静默转码。
     处理失败时返回原路径（由调用方决定是否放行）。
     """
     try:
@@ -982,19 +990,44 @@ def _preprocess_reference_image(image_path, max_side=2048, quality=92, max_bytes
         return image_path
 
 
+def _is_png_reference(image_path):
+    """
+    按真实文件内容判断是否 PNG，可识破把 .png 改名成 .jpg 的情况。
+    无法识别格式时返回 False，交给后续预处理链路报错。
+    """
+    try:
+        from PIL import Image
+
+        with Image.open(image_path) as image:
+            return (image.format or "").upper() == "PNG"
+    except Exception:
+        return False
+
+
 def _resolve_reference_image_url(image_path):
     """
     将参考图转换为文档支持的值：公网 URL 原样透传；本地图片预处理后转
     data:image/jpeg;base64，避免上传到第三方公共图床。
+
+    PNG 一律不处理、不转码，直接报错要求用户先转成 JPG。
     """
     if not image_path:
         return None
     text = str(image_path)
-    if text.startswith(("http://", "https://", "data:image/")):
+    if text.startswith(("http://", "https://")):
+        return text
+    if text.startswith("data:image/"):
+        if "png" in text.split(",", 1)[0].lower():
+            raise Exception(f"PLUGIN_ERROR:::参考图{_PNG_REFERENCE_HINT}")
         return text
     if not os.path.exists(text):
         print(f"[参考图] 文件不存在: {text}")
         return None
+    if _is_png_reference(text):
+        print(f"[参考图] 检测到 PNG 格式，已拒绝: {text}")
+        raise Exception(
+            f"PLUGIN_ERROR:::参考图「{os.path.basename(text)}」{_PNG_REFERENCE_HINT}"
+        )
     upload_path = _preprocess_reference_image(text)
     if upload_path == text:
         raise Exception(

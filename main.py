@@ -39,7 +39,7 @@ from plugin_utils import load_plugin_config
 
 _PLUGIN_FILE = __file__
 _PLUGIN_ID = "video_plugin_youzan_aigc"
-_PLUGIN_VERSION = "1.1.6"
+_PLUGIN_VERSION = "1.1.7"
 _DEFAULT_UPDATE_MANIFEST_URL = (
     "https://cdn.jsdelivr.net/gh/609335334-rgb/"
     "youzan-aigc-plugin-updates@main/manifest.json"
@@ -563,12 +563,8 @@ def _recover_submitted_task_id(
 # 上游对参考素材做安全校验时的典型错误关键词
 _REFERENCE_REJECTION_KEYWORDS = ("引用素材", "参考图", "安全校验", "素材未通过", "image check", "safety")
 
-# PNG 参考图统一拒绝：不做静默转码，直接让用户先转成 JPG
-_PNG_REFERENCE_HINT = (
-    "不支持 PNG 格式，请先转成 JPG 再提交"
-    "（带透明通道的图请先合上白色或其他实底背景再转 JPG）；"
-    "也可以在高级设置的「参考图 URL」中填写 JPG 公网直链。"
-)
+# 参考图转 JPEG 时的合成底色（PNG 透明通道会合成到该颜色上）
+_REFERENCE_JPEG_BACKGROUND = (255, 255, 255)
 
 
 def _build_submit_error(response):
@@ -578,7 +574,7 @@ def _build_submit_error(response):
         error_text += (
             "（排查提示：多为参考图内容或尺寸触发上游安全校验。"
             "可先换一张干净的图试生成，或改用文生视频确认模型可用；"
-            "插件已对参考图做限尺寸预处理，但 PNG 需自行先转成 JPG）"
+            "插件已自动对参考图做转 JPEG / 限尺寸预处理）"
         )
     return f"PLUGIN_ERROR:::{_describe_api_error(error_text)}"
 
@@ -939,13 +935,39 @@ def _collect_video_references(context, max_count=5, timeout=60):
     return paths
 
 
+def _flatten_to_rgb(image, background=None):
+    """
+    把任意模式的 PIL 图片安全拍平成 JPEG 可用的图像。
+
+    直接 convert("RGB") 有两个坑：透明通道被丢掉但不与背景合成（透明区变黑），
+    16bit / I 模式超过 255 的数值被截断（中高调整片过曝成纯白）。
+    这里先把高位深归一化到 8bit，再把 alpha 合成到实底。
+    """
+    from PIL import Image
+
+    if image.mode in ("I", "I;16", "I;16B", "I;16L"):
+        image = image.point(lambda value: value * (255.0 / 65535.0)).convert("L")
+    elif image.mode == "F":
+        image = image.point(lambda value: min(max(value, 0.0), 1.0) * 255).convert("L")
+    if image.mode == "P" and "transparency" in image.info:
+        image = image.convert("RGBA")
+    if image.mode in ("RGBA", "LA", "PA"):
+        rgba = image.convert("RGBA")
+        base_color = _REFERENCE_JPEG_BACKGROUND if background is None else background
+        flattened = Image.new("RGB", image.size, base_color)
+        flattened.paste(rgba, mask=rgba.getchannel("A"))
+        return flattened
+    if image.mode in ("RGB", "L"):
+        return image
+    return image.convert("RGB")
+
+
 def _convert_image_to_jpeg(image, max_side=2048, quality=92, max_bytes=8 * 1024 * 1024):
-    """把已打开的 PIL 图片统一转成 JPEG bytes：去 alpha、限最长边、压体积。"""
+    """把已打开的 PIL 图片统一转成 JPEG bytes：拍平、限最长边、压体积。"""
     import io
     from PIL import Image
 
-    if image.mode not in ("RGB", "L"):
-        image = image.convert("RGB")
+    image = _flatten_to_rgb(image)
     width, height = image.size
     longest = max(width, height)
     if longest > max_side:
@@ -967,41 +989,39 @@ def _convert_image_to_jpeg(image, max_side=2048, quality=92, max_bytes=8 * 1024 
 
 def _preprocess_reference_image(image_path, max_side=2048, quality=92, max_bytes=8 * 1024 * 1024):
     """
-    参考图预处理：非 PNG 图片统一转 JPEG、限最长边、压体积，返回临时 .jpg 路径。
+    参考图预处理：统一转 JPEG、限最长边、压体积，返回临时 .jpg 路径。
 
-    上游安全校验对参考图的格式 / 尺寸 / 体积较敏感，
-    先规范化可排除「过大 / 非标准格式」导致的拒检。
-    PNG 在进入本函数前就被 _resolve_reference_image_url 直接拒绝，此处不做静默转码。
+    PNG 也走这条路：透明通道合成到白底、16bit 归一化到 8bit、动图只取第 1 帧，
+    避免 convert("RGB") 造成的透明区变黑 / 高位深过曝。
     处理失败时返回原路径（由调用方决定是否放行）。
     """
     try:
         from PIL import Image
 
         image = Image.open(image_path)
+        source_format = (image.format or "").upper()
+        frame_count = getattr(image, "n_frames", 1)
+        if frame_count > 1:
+            image.seek(0)
         image.load()
         jpeg_bytes = _convert_image_to_jpeg(image, max_side=max_side, quality=quality, max_bytes=max_bytes)
         temp_path = f"{image_path}_preprocessed.jpg"
         with open(temp_path, "wb") as file_obj:
             file_obj.write(jpeg_bytes)
-        print(f"[参考图] 已预处理: {image_path} -> {temp_path}（最长边 {max(image.size)}px, {len(jpeg_bytes) // 1024}KB）")
+        notes = [f"源格式 {source_format}"] if source_format else []
+        if image.mode in ("RGBA", "LA", "PA") or (image.mode == "P" and "transparency" in image.info):
+            notes.append("透明通道已合成白底")
+        if frame_count > 1:
+            notes.append(f"动图仅取第 1 帧（共 {frame_count} 帧）")
+        suffix = "，" + "，".join(notes) if notes else ""
+        print(
+            f"[参考图] 已预处理: {image_path} -> {temp_path}"
+            f"（最长边 {max(image.size)}px, {len(jpeg_bytes) // 1024}KB{suffix}）"
+        )
         return temp_path
     except Exception as exc:
         print(f"[参考图] 预处理失败: {exc}")
         return image_path
-
-
-def _is_png_reference(image_path):
-    """
-    按真实文件内容判断是否 PNG，可识破把 .png 改名成 .jpg 的情况。
-    无法识别格式时返回 False，交给后续预处理链路报错。
-    """
-    try:
-        from PIL import Image
-
-        with Image.open(image_path) as image:
-            return (image.format or "").upper() == "PNG"
-    except Exception:
-        return False
 
 
 def _resolve_reference_image_url(image_path):
@@ -1009,25 +1029,17 @@ def _resolve_reference_image_url(image_path):
     将参考图转换为文档支持的值：公网 URL 原样透传；本地图片预处理后转
     data:image/jpeg;base64，避免上传到第三方公共图床。
 
-    PNG 一律不处理、不转码，直接报错要求用户先转成 JPG。
+    PNG（含透明底 / 16bit / 动图）统一由 _preprocess_reference_image 安全转换，
+    不要求用户手动先转 JPG。
     """
     if not image_path:
         return None
     text = str(image_path)
-    if text.startswith(("http://", "https://")):
-        return text
-    if text.startswith("data:image/"):
-        if "png" in text.split(",", 1)[0].lower():
-            raise Exception(f"PLUGIN_ERROR:::参考图{_PNG_REFERENCE_HINT}")
+    if text.startswith(("http://", "https://", "data:image/")):
         return text
     if not os.path.exists(text):
         print(f"[参考图] 文件不存在: {text}")
         return None
-    if _is_png_reference(text):
-        print(f"[参考图] 检测到 PNG 格式，已拒绝: {text}")
-        raise Exception(
-            f"PLUGIN_ERROR:::参考图「{os.path.basename(text)}」{_PNG_REFERENCE_HINT}"
-        )
     upload_path = _preprocess_reference_image(text)
     if upload_path == text:
         raise Exception(

@@ -2,10 +2,10 @@
   "plugins": [
     {
       "plugin_id": "video_plugin_youzan_aigc",
-      "version": "1.1.5",
-      "download_url": "https://cdn.jsdelivr.net/gh/609335334-rgb/youzan-aigc-plugin-updates@main/youzan-aigc-plugin-v1.1.5-20260915143140.zip",
-      "sha256": "066d3cd93591667cb833528797696cd1eabe79014fb8beb866cd23252e56ab46",
-      "changelog": "安装更新前校验更新包版本：包内版本须与更新清单一致且高于当前版本，避免装到旧包；覆盖前备份全部被替换文件，失败可完整回滚。"
+      "version": "1.1.6",
+      "download_url": "https://cdn.jsdelivr.net/gh/609335334-rgb/youzan-aigc-plugin-updates@main/youzan-aigc-plugin-v1.1.6-20260916095801.zip",
+      "sha256": "ad778c286fa05b5d606b42723187a98b46c9523021589083e28a1e985d9b1b71",
+      "changelog": "参考图不再接受 PNG：检测到 PNG（含改名为 .jpg 的伪 PNG）直接报错并提示先转成 JPG；同时修正参考图被上游拒绝时的排查提示文案。"
     }
   ]
 }

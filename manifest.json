@@ -2,10 +2,10 @@
   "plugins": [
     {
       "plugin_id": "video_plugin_youzan_aigc",
-      "version": "1.1.6",
-      "download_url": "https://cdn.jsdelivr.net/gh/609335334-rgb/youzan-aigc-plugin-updates@main/youzan-aigc-plugin-v1.1.6-20260916095801.zip",
-      "sha256": "ad778c286fa05b5d606b42723187a98b46c9523021589083e28a1e985d9b1b71",
-      "changelog": "参考图不再接受 PNG：检测到 PNG（含改名为 .jpg 的伪 PNG）直接报错并提示先转成 JPG；同时修正参考图被上游拒绝时的排查提示文案。"
+      "version": "1.1.7",
+      "download_url": "https://cdn.jsdelivr.net/gh/609335334-rgb/youzan-aigc-plugin-updates@main/youzan-aigc-plugin-v1.1.7-20260916150425.zip",
+      "sha256": "ce7612dd75865e075b9f5cda1025cfd81d525d1892db112a8c839b5e21e88649",
+      "changelog": "参考图 PNG 改为全自动安全转换：透明通道合成到白底（不再变黑）、16bit 自动归一化到 8bit（不再过曝）、动图只取第 1 帧，不再要求手动转 JPG。"
     }
   ]
 }

@@ -1,0 +1,8 @@
+{
+  "name": "AIGC创作站·生视频",
+  "display_name": "AIGC创作站·生视频",
+  "version": "1.2.1",
+  "description": "通过 youzan666.vip AIGC 网关调用视频模型生成视频，支持文生视频 / 图生视频 / 多模态参考素材稳定绑定。",
+  "author": "youzan-aigc",
+  "type": "video"
+}

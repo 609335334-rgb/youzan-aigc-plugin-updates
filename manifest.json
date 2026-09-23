@@ -1,0 +1,11 @@
+{
+  "plugins": [
+    {
+      "plugin_id": "video_plugin_youzan_aigc",
+      "version": "1.2.1",
+      "download_url": "https://cdn.jsdelivr.net/gh/609335334-rgb/youzan-aigc-plugin-updates@main/video_plugin_youzan_aigc-1.2.1.zip",
+      "sha256": "174cc7b26f7209e71f496af45e194710aed6b058c234f6f399d10d54f3b4ec95",
+      "changelog": "修复参考图和音频素材引用混乱：@ 为可选语法，支持图1/图片1/音频1；无显式 @ 时按素材槽位顺序发送，避免提示词文字顺序造成错位。"
+    }
+  ]
+}
